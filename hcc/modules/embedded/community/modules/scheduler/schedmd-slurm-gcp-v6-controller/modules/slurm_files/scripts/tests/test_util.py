@@ -17,7 +17,14 @@ from typing import Optional, Type
 import pytest
 from mock import Mock
 from datetime import datetime, timezone, timedelta
+import json
+import subprocess
+import sys
+import textwrap
+import threading
+import time
 import unittest
+from pathlib import Path
 
 from common import TstNodeset, TstCfg # needed to import util
 import util
@@ -405,6 +412,155 @@ def test_node_state(node: str, state: Optional[NodeState], want: NodeState | Non
     ])
 def test_MachineType_from_json(jo: dict, want: MachineType):
     assert MachineType.from_json(jo) == want
+
+
+A100 = MachineType(
+    name="a2-highgpu-1g",
+    guest_cpus=12,
+    memory_mb=87040,
+    accelerators=[AcceleratorInfo(type="nvidia-tesla-a100", count=1)],
+)
+T2D = MachineType(
+    name="t2d-standard-8", guest_cpus=8, memory_mb=32768, accelerators=[]
+)
+
+@pytest.mark.parametrize("mt", [A100, T2D])
+def test_MachineType_to_json(mt: MachineType):
+    assert MachineType.from_json(json.loads(json.dumps(mt.to_json()))) == mt
+
+
+@pytest.mark.parametrize(
+    "machine_type,gpu",
+    [
+        (A100, A100.accelerators[0]),
+        (T2D, None),
+    ])
+def test_template_json_roundtrip(machine_type: MachineType, gpu):
+    template = util.NSDict({
+        "name": "tpl",
+        "machineType": machine_type.name,
+        "advancedMachineFeatures": {"threadsPerCore": 1},
+        "disks": [{"initializeParams": {"diskType": "pd-ssd"}}],
+    })
+    template.machine_type = machine_type
+    template.gpu = gpu
+
+    jo = json.loads(json.dumps(util._template_to_json(template)))
+    got = util._template_from_json(jo)
+
+    assert got.machine_type == machine_type
+    assert got.gpu == gpu
+    assert got.to_dict() == template.to_dict()
+
+
+def test_json_cache(tmp_path):
+    path = tmp_path / "cache.json"
+
+    with util.json_cache(path) as cache:
+        assert cache == {}
+        cache["dropped"] = 1
+    assert not path.exists()
+
+    with util.json_cache(path, writeback=True) as cache:
+        cache["kept"] = {"n": 1}
+    assert json.loads(path.read_text()) == {"kept": {"n": 1}}
+
+    path.write_text("not json")
+    with util.json_cache(path) as cache:
+        assert cache == {}
+
+
+def test_json_cache_not_written_when_body_raises(tmp_path):
+    path = tmp_path / "cache.json"
+    with util.json_cache(path, writeback=True) as cache:
+        cache["before"] = 1
+
+    with pytest.raises(ValueError):
+        with util.json_cache(path, writeback=True) as cache:
+            cache["after"] = 2
+            raise ValueError("boom")
+
+    assert json.loads(path.read_text()) == {"before": 1}
+
+
+def test_json_cache_serializes_concurrent_writers(tmp_path):
+    path = tmp_path / "cache.json"
+    started = threading.Event()
+
+    def writer(key, hold):
+        with util.json_cache(path, writeback=True) as cache:
+            started.set()
+            time.sleep(hold)
+            cache[key] = 1
+
+    slow = threading.Thread(target=writer, args=("A", 0.3))
+    slow.start()
+    assert started.wait(2), "first writer never entered the cache"
+    fast = threading.Thread(target=writer, args=("B", 0))
+    fast.start()
+    slow.join(5)
+    fast.join(5)
+
+    assert json.loads(path.read_text()) == {"A": 1, "B": 1}
+
+
+def test_json_cache_serializes_concurrent_processes(tmp_path):
+    path = tmp_path / "cache.json"
+    prog = textwrap.dedent(f"""
+        import sys, time
+        sys.path.insert(0, {str(Path(util.__file__).parent)!r})
+        from pathlib import Path
+        import util
+        with util.json_cache(Path({str(path)!r}), writeback=True) as cache:
+            time.sleep(float(sys.argv[2]))
+            cache[sys.argv[1]] = 1
+    """)
+    slow = subprocess.Popen([sys.executable, "-c", prog, "A", "0.5"])
+    time.sleep(0.15)
+    fast = subprocess.Popen([sys.executable, "-c", prog, "B", "0"])
+    assert slow.wait(60) == 0
+    assert fast.wait(60) == 0
+
+    assert json.loads(path.read_text()) == {"A": 1, "B": 1}
+
+
+def test_json_cache_warns_on_unreadable_file(tmp_path, caplog):
+    path = tmp_path / "cache.json"
+
+    with caplog.at_level("WARNING", logger=util.log.name):
+        with util.json_cache(path) as cache:
+            assert cache == {}
+    assert caplog.records == [], "a missing cache is normal and must not warn"
+
+    path.write_text("not json")
+    with caplog.at_level("WARNING", logger=util.log.name):
+        with util.json_cache(path) as cache:
+            assert cache == {}
+    assert any("Discarding unreadable cache" in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"name": "tpl"},                      # no machine_type
+        {"machine_type": {"name": "n"}},      # machine_type missing fields
+        {"machine_type": None},
+        "a string, not an object",
+    ])
+def test_template_info_ignores_malformed_cache_entry(tmp_path, entry):
+    lkp = util.Lookup(util.NSDict({"project": "proj"}))
+    lkp.template_cache_path = tmp_path / "template_info.cache.json"
+    lkp.template_cache_path.write_text(json.dumps({"tpl": entry}))
+
+    properties = {"machineType": "custom-4-8192", "advancedMachineFeatures": {}}
+    with unittest.mock.patch.object(util, "ensure_execute", return_value={"properties": properties}), \
+         unittest.mock.patch.object(util, "chown_slurm"), \
+         unittest.mock.patch.object(util.Lookup, "compute", unittest.mock.MagicMock()):
+        got = lkp.template_info("projects/proj/global/instanceTemplates/tpl")
+
+    assert got.machine_type.guest_cpus == 4
+    assert json.loads(lkp.template_cache_path.read_text())["tpl"]["machine_type"]["guestCpus"] == 4
+
 
 UTC, PST = timezone.utc, timezone(timedelta(hours=-8))
 

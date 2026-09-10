@@ -14,11 +14,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Iterable, List, Tuple, Optional, Any, Dict, Sequence, Type, Callable, Literal
+from typing import Iterable, List, Tuple, Optional, Any, Dict, Sequence, Type, Callable
 import argparse
 import base64
 from dataclasses import dataclass, field
 from datetime import timedelta, datetime, timezone
+import fcntl
 import hashlib
 import inspect
 import json
@@ -28,7 +29,6 @@ import logging.handlers
 import math
 import os
 import re
-import shelve
 import shlex
 import shutil
 import socket
@@ -129,6 +129,12 @@ class AcceleratorInfo:
             type=jo["guestAcceleratorType"],
             count=jo["guestAcceleratorCount"])
 
+    def to_json(self) -> dict:
+        return {
+            "guestAcceleratorType": self.type,
+            "guestAcceleratorCount": self.count,
+        }
+
 @dataclass(frozen=True)
 class MachineType:
     name: str
@@ -145,6 +151,14 @@ class MachineType:
             accelerators=[
                 AcceleratorInfo.from_json(a) for a in jo.get("accelerators", [])],
         )
+
+    def to_json(self) -> dict:
+        return {
+            "name": self.name,
+            "guestCpus": self.guest_cpus,
+            "memoryMb": self.memory_mb,
+            "accelerators": [a.to_json() for a in self.accelerators],
+        }
 
     @property
     def family(self) -> str:
@@ -810,6 +824,45 @@ def chown_slurm(path: Path, mode=None) -> None:
 
 
 @contextmanager
+def json_cache(path: Path, writeback: bool = False):
+    """Yield the dict stored in a JSON cache file.
+
+    A missing file yields an empty cache; an unreadable one yields an empty
+    cache and logs a warning. The context holds a lock on a sidecar file for
+    its whole duration, shared for reads and exclusive for writeback, so
+    concurrent read-modify-write cycles cannot drop each other's entries.
+    Writeback goes through a temporary file so readers never observe a partial
+    cache, and nothing is written back if the body raises.
+    """
+    lock_fd = os.open(f"{path}.lock", os.O_RDONLY | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX if writeback else fcntl.LOCK_SH)
+        try:
+            cache = json.loads(path.read_text())
+        except FileNotFoundError:
+            cache = {}
+        except (OSError, ValueError) as e:
+            log.warning(f"Discarding unreadable cache {path}: {e}")
+            cache = {}
+
+        yield cache
+
+        if not writeback:
+            return
+        tmp = tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False)
+        try:
+            with tmp:
+                json.dump(cache, tmp)
+            os.chmod(tmp.name, 0o644)
+            os.replace(tmp.name, path)
+        except BaseException:
+            Path(tmp.name).unlink(missing_ok=True)
+            raise
+    finally:
+        os.close(lock_fd)
+
+
+@contextmanager
 def cd(path):
     """Change working directory for context"""
     prev = Path.cwd()
@@ -1337,12 +1390,27 @@ class NodeState:
     base: str
     flags: frozenset
 
+
+def _template_to_json(template: NSDict) -> dict:
+    jo = template.to_dict()
+    jo["machine_type"] = template.machine_type.to_json()
+    jo["gpu"] = template.gpu.to_json() if template.gpu else None
+    return jo
+
+
+def _template_from_json(jo: dict) -> NSDict:
+    template = NSDict(jo)
+    template.machine_type = MachineType.from_json(jo["machine_type"])
+    template.gpu = AcceleratorInfo.from_json(jo["gpu"]) if jo.get("gpu") else None
+    return template
+
+
 class Lookup:
     """Wrapper class for cached data access"""
 
     def __init__(self, cfg):
         self._cfg = cfg
-        self.template_cache_path = Path(__file__).parent / "template_info.cache"
+        self.template_cache_path = Path(__file__).parent / "template_info.cache.json"
 
     @property
     def cfg(self):
@@ -1788,38 +1856,15 @@ class Lookup:
         machine_conf.memory = machine.memory_mb - (400 + (30 * gb))
         return machine_conf
 
-    @contextmanager
-    def template_cache(self, writeback=False):
-        flag: Literal["c", "r"] = "c" if writeback else "r"
-        err = None
-        for wait in backoff_delay(0.125, timeout=60, count=20):
-            try:
-                cache = shelve.open(
-                    str(self.template_cache_path), flag=flag, writeback=writeback
-                )
-                break
-            except OSError as e:
-                err = e
-                log.debug(f"Failed to access template info cache: {e}")
-                sleep(wait)
-                continue
-        else:
-            # reached max_count of waits
-            raise Exception(f"Failed to access cache file. latest error: {err}")
-        try:
-            yield cache
-        finally:
-            cache.close()
-
     @lru_cache(maxsize=None)
     def template_info(self, template_link):
         template_name = trim_self_link(template_link)
-        # split read and write access to minimize write-lock. This might be a
-        # bit slower? TODO measure
-        if self.template_cache_path.exists():
-            with self.template_cache() as cache:
-                if template_name in cache:
-                    return NSDict(cache[template_name])
+        with json_cache(self.template_cache_path) as cache:
+            if template_name in cache:
+                try:
+                    return _template_from_json(cache[template_name])
+                except (AttributeError, KeyError, TypeError, ValueError) as e:
+                    log.warning(f"Ignoring malformed template cache entry for {template_name}: {e}")
 
         template = ensure_execute(
             self.compute.instanceTemplates().get(
@@ -1845,9 +1890,8 @@ class Lookup:
         else:
             template.gpu = None
 
-        # keep write access open for minimum time
-        with self.template_cache(writeback=True) as cache:
-            cache[template_name] = template.to_dict()
+        with json_cache(self.template_cache_path, writeback=True) as cache:
+            cache[template_name] = _template_to_json(template)
         # cache should be owned by slurm
         chown_slurm(self.template_cache_path)
 

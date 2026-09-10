@@ -16,7 +16,6 @@
 from typing import Dict, Callable, Any
 import argparse
 import os
-import shelve
 import uuid
 from collections import namedtuple
 from datetime import datetime, timedelta, timezone
@@ -27,7 +26,7 @@ import util
 from google.api_core import exceptions, retry
 from google.cloud import bigquery as bq
 from google.cloud.bigquery import SchemaField # type: ignore
-from util import lookup, run
+from util import json_cache, lookup, run
 
 SACCT = "sacct"
 script = Path(__file__).resolve()
@@ -45,7 +44,7 @@ BQ_ROW_BATCH_SIZE = 5000
 # cluster_id = uuid.uuid4().hex
 # cluster_id_file.write_text(cluster_id)
 
-job_idx_cache_path = script.parent / "bq_job_idx_cache"
+job_idx_cache_path = script.parent / "bq_job_idx_cache.json"
 
 SLURM_TIME_FORMAT = r"%Y-%m-%dT%H:%M:%S"
 
@@ -236,7 +235,9 @@ def load_slurm_jobs(start, end):
     jobs = [dict(zip(bq_fields, line.split("|"))) for line in text]
 
     # The job index cache allows us to avoid sending duplicate jobs. This avoids a race condition with updating the database.
-    with shelve.open(str(job_idx_cache_path), flag="r") as job_idx_cache:
+    # An unreadable cache reads as empty and is logged, so every job in the window is re-sent
+    # rather than the run aborting.
+    with json_cache(job_idx_cache_path) as job_idx_cache:
         job_rows = [
             make_job_row(job)
             for job in jobs
@@ -259,10 +260,14 @@ def init_table():
 
 def purge_job_idx_cache():
     purge_time = datetime.now() - timedelta(minutes=30)
-    with shelve.open(str(job_idx_cache_path), writeback=True) as cache:
+    with json_cache(job_idx_cache_path, writeback=True) as cache:
         to_delete = []
         for idx, stamp in cache.items():
-            if stamp < purge_time:
+            try:
+                expired = datetime.fromisoformat(stamp) < purge_time
+            except (TypeError, ValueError):
+                expired = True
+            if expired:
                 to_delete.append(idx)
         for idx in to_delete:
             del cache[idx]
@@ -306,10 +311,10 @@ def write_timestamp(time):
 
 
 def update_job_idx_cache(jobs, timestamp):
-    with shelve.open(str(job_idx_cache_path), writeback=True) as job_idx_cache:
+    with json_cache(job_idx_cache_path, writeback=True) as job_idx_cache:
         for job in jobs:
             job_idx = str(job["job_db_uuid"])
-            job_idx_cache[job_idx] = timestamp
+            job_idx_cache[job_idx] = timestamp.isoformat()
 
 
 def main():
